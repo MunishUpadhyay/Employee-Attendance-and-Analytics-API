@@ -9,16 +9,17 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator, model_validator
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import PyMongoError
 from pymongo.errors import DuplicateKeyError
 from contextlib import asynccontextmanager
+from decimal import Decimal, ROUND_HALF_UP
 
 load_dotenv()
 
@@ -60,7 +61,14 @@ def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    duration_seconds = Decimal(
+        str((punch_out - punch_in).total_seconds())
+    )
+    hours = duration_seconds / Decimal("3600")
+
+    return float(
+        hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    )
 
 
 def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
@@ -136,6 +144,10 @@ class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = None
     status: str = "PRESENT"
+
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[int] = Field(default=None, strict=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -245,6 +257,132 @@ def punch_in(body: PunchInIn):
     doc.pop("_id", None)
     return doc
 
+
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+
+    if emp is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found"
+        )
+
+    try:
+        ts = (
+            datetime.fromtimestamp(
+                body.punched_at / 1000,
+                tz=timezone.utc
+            )
+            if body.punched_at is not None
+            else datetime.now(timezone.utc)
+        )
+        ts = ts.replace(microsecond=0)
+
+    except (OverflowError, OSError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid punched_at timestamp"
+        )
+
+    record = db.attendance_logs.find_one(
+        {
+            "emp_code": body.emp_code,
+            "punch_in": {"$ne": None, "$lte": ts}
+        },
+        sort=[("punch_in", -1)]
+    )
+
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No punch-in record found"
+        )
+
+    punch_in_time = record["punch_in"]
+
+    if punch_in_time.tzinfo is None:
+        punch_in_time = punch_in_time.replace(
+            tzinfo=timezone.utc
+        )
+
+    if ts <= punch_in_time:
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out must be after punch-in"
+        )
+
+    elapsed = ts - punch_in_time
+
+    if elapsed > timedelta(hours=24):
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out cannot be more than 24 hours after punch-in"
+        )
+
+    if record.get("punch_out") is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Attendance record already punched out"
+        )
+
+    work_hours = compute_work_hours(
+        punch_in_time,
+        ts
+    )
+
+    shift_end_time = datetime.fromisoformat(
+        f"{record['date']}T{emp['shift_end']}"
+    ).replace(tzinfo=IST)
+
+    if emp["shift_end"] <= emp["shift_start"]:
+        shift_end_time += timedelta(days=1)
+
+    punch_out_ist = ts.astimezone(IST)
+
+    overtime_seconds = (
+        punch_out_ist - shift_end_time
+    ).total_seconds()
+
+    overtime_minutes = (
+        int(overtime_seconds // 60)
+        if overtime_seconds >= 30 * 60
+        else 0
+    )
+
+    half_day = work_hours < 4.50
+
+    updated = db.attendance_logs.find_one_and_update(
+        {
+            "_id": record["_id"],
+            "punch_out": None
+        },
+        {
+            "$set": {
+                "punch_out": ts,
+                "work_hours": work_hours,
+                "overtime_minutes": overtime_minutes,
+                "half_day": half_day
+            }
+        },
+        return_document=ReturnDocument.AFTER
+    )
+
+    if updated is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Attendance record already punched out"
+        )
+
+    updated.pop("_id", None)
+    updated.setdefault("history", [])
+    updated.setdefault("late_minutes", 0)
+    updated.setdefault("overtime_minutes", 0)
+    updated.setdefault("half_day", False)
+
+    return serialize_datetimes(updated)
 
 
 @app.get("/attendance")
