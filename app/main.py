@@ -140,12 +140,31 @@ class EmployeeIn(BaseModel):
         return self
 
 
+
 class PunchInIn(BaseModel):
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"emp_code": "string"}
+            ]
+        }
+    }
+
     emp_code: str
-    punched_at: Optional[int] = None
+    punched_at: Optional[int] = Field(default=None, strict=True)
     status: str = "PRESENT"
 
+
+
 class PunchOutIn(BaseModel):
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"emp_code": "E101"}
+            ]
+        }
+    }
+
     emp_code: str
     punched_at: Optional[int] = Field(default=None, strict=True)
 
@@ -222,17 +241,39 @@ def punch_in(body: PunchInIn):
             detail="Employee not found"
         )
 
-    ts = (
-        datetime.fromtimestamp(body.punched_at / 1000, tz=timezone.utc)
-        if body.punched_at is not None
-        else datetime.now(timezone.utc)
-    )
+    if body.status not in {"PRESENT", "WFH", "ON_DUTY"}:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid status for punch-in"
+        )
+  
+    if body.punched_at is not None and not (
+        100000000000 <= body.punched_at <= 4102444800000
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid punched_at timestamp"
+        )
+
+    try:
+        ts = (
+            datetime.fromtimestamp(
+                body.punched_at / 1000,
+                tz=timezone.utc
+            )
+            if body.punched_at is not None
+            else datetime.now(timezone.utc)
+        )
+        ts = ts.replace(microsecond=0)
+    except (OverflowError, OSError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid punched_at timestamp"
+        )
 
     ts = ts.astimezone(IST)
     d = ts.date().isoformat()
 
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -240,24 +281,24 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(
+            ts, emp["shift_start"]
+        ),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
+
     try:
-        res = db.attendance_logs.insert_one(doc)
+        db.attendance_logs.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(
             status_code=409,
             detail="already punched in for this date"
         )
-        
-    doc["id"] = str(res.inserted_id)
+
     doc.pop("_id", None)
-    return doc
-
-
+    return serialize_datetimes(doc)
 
 
 @app.post("/attendance/punch-out")
@@ -268,6 +309,14 @@ def punch_out(body: PunchOutIn):
         raise HTTPException(
             status_code=404,
             detail="Employee not found"
+        )
+
+    if body.punched_at is not None and not (
+        100000000000 <= body.punched_at <= 4102444800000
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid punched_at timestamp"
         )
 
     try:
@@ -296,6 +345,15 @@ def punch_out(body: PunchOutIn):
     )
 
     if record is None:
+        record = db.attendance_logs.find_one(
+            {
+                "emp_code": body.emp_code,
+                "punch_in": {"$ne": None, "$gt": ts}
+            },
+            sort=[("punch_in", 1)]
+        )
+
+    if record is None:
         raise HTTPException(
             status_code=404,
             detail="No punch-in record found"
@@ -316,16 +374,10 @@ def punch_out(body: PunchOutIn):
 
     elapsed = ts - punch_in_time
 
-    if elapsed > timedelta(hours=24):
-        raise HTTPException(
-            status_code=422,
-            detail="Punch-out cannot be more than 24 hours after punch-in"
-        )
-
     if record.get("punch_out") is not None:
         raise HTTPException(
             status_code=409,
-            detail="Attendance record already punched out"
+            detail="Attendance record has already been punched out"
         )
 
     work_hours = compute_work_hours(
@@ -373,7 +425,7 @@ def punch_out(body: PunchOutIn):
     if updated is None:
         raise HTTPException(
             status_code=409,
-            detail="Attendance record already punched out"
+            detail="Attendance record has already been punched out"
         )
 
     updated.pop("_id", None)
