@@ -10,7 +10,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from datetime import datetime, timedelta, timezone, time
-from typing import Optional
+from typing import Optional, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -29,10 +29,15 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.employees.create_index("emp_code", unique=True)
+    db.employees.create_index([("department", 1), ("emp_code", 1)])
 
     db.attendance_logs.create_index(
         [("emp_code", 1), ("date", 1)],
         unique=True
+    )
+
+    db.attendance_logs.create_index(
+        [("emp_code", 1), ("punch_in", -1)]
     )
 
     db.attendance_logs.create_index(
@@ -56,8 +61,10 @@ app = FastAPI(
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     h, m = map(int, shift_start.split(":"))
     start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+    diff_seconds = (punch_in - start).total_seconds()
+    if diff_seconds > 600:
+        return int(diff_seconds // 60)
+    return 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -71,10 +78,18 @@ def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     )
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
+def compute_overtime(punch_out: datetime, shift_end: str, date_str: str, shift_start: Optional[str] = None) -> int:
     h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, second=0, microsecond=0, tzinfo=IST)
+    if shift_start and shift_end <= shift_start:
+        end += timedelta(days=1)
+    if punch_out.tzinfo is None:
+        punch_out = punch_out.replace(tzinfo=timezone.utc)
+    punch_out_ist = punch_out.astimezone(IST)
+    diff_seconds = (punch_out_ist - end).total_seconds()
+    if diff_seconds >= 1800:
+        return int(diff_seconds // 60)
+    return 0
 
 
 def serialize_datetimes(value):
@@ -190,7 +205,7 @@ def create_employee(body: EmployeeIn):
         raise HTTPException(409, "emp_code already exists")
 
     doc = body.model_dump()
-    doc["created_at"] = datetime.now(timezone.utc)
+    doc["created_at"] = datetime.now(timezone.utc).replace(microsecond=0)
 
     try:
         db.employees.insert_one(doc)
@@ -201,7 +216,7 @@ def create_employee(body: EmployeeIn):
         )
 
     doc.pop("_id", None)
-    return doc
+    return serialize_datetimes(doc)
 
 
 @app.get("/employees")
@@ -224,7 +239,7 @@ def list_employees(
     )
 
     return {
-        "items": items,
+        "items": serialize_datetimes(items),
         "total": total,
         "page": page,
         "page_size": page_size
@@ -272,7 +287,11 @@ def punch_in(body: PunchInIn):
         )
 
     ts = ts.astimezone(IST)
-    d = ts.date().isoformat()
+    end_h, end_m = map(int, emp["shift_end"].split(":"))
+    if emp["shift_end"] <= emp["shift_start"] and ts.time() < time(end_h, end_m):
+        d = (ts - timedelta(days=1)).date().isoformat()
+    else:
+        d = ts.date().isoformat()
 
     doc = {
         "emp_code": body.emp_code,
@@ -374,6 +393,12 @@ def punch_out(body: PunchOutIn):
 
     elapsed = ts - punch_in_time
 
+    if elapsed > timedelta(hours=24):
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out cannot be more than 24 hours after punch-in"
+        )
+
     if record.get("punch_out") is not None:
         raise HTTPException(
             status_code=409,
@@ -385,23 +410,8 @@ def punch_out(body: PunchOutIn):
         ts
     )
 
-    shift_end_time = datetime.fromisoformat(
-        f"{record['date']}T{emp['shift_end']}"
-    ).replace(tzinfo=IST)
-
-    if emp["shift_end"] <= emp["shift_start"]:
-        shift_end_time += timedelta(days=1)
-
-    punch_out_ist = ts.astimezone(IST)
-
-    overtime_seconds = (
-        punch_out_ist - shift_end_time
-    ).total_seconds()
-
-    overtime_minutes = (
-        int(overtime_seconds // 60)
-        if overtime_seconds >= 30 * 60
-        else 0
+    overtime_minutes = compute_overtime(
+        ts, emp["shift_end"], record["date"], emp["shift_start"]
     )
 
     half_day = work_hours < 4.50
@@ -442,7 +452,7 @@ def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    status: Optional[str] = None,
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
@@ -511,6 +521,12 @@ def list_attendance(
         .skip(skip)
         .limit(page_size)
     )
+
+    for item in items:
+        item.setdefault("half_day", False)
+        item.setdefault("history", [])
+        item.setdefault("late_minutes", 0)
+        item.setdefault("overtime_minutes", 0)
 
     return {
         "items": serialize_datetimes(items),
