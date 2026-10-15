@@ -21,6 +21,7 @@ from pymongo.errors import PyMongoError
 from pymongo.errors import DuplicateKeyError
 from contextlib import asynccontextmanager
 from decimal import Decimal, ROUND_HALF_UP
+from bson.decimal128 import Decimal128
 
 load_dotenv()
 
@@ -31,6 +32,7 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 async def lifespan(app: FastAPI):
     db.employees.create_index("emp_code", unique=True)
     db.employees.create_index([("department", 1), ("emp_code", 1)])
+    db.employees.create_index("joined_on")
 
     db.attendance_logs.create_index(
         [("emp_code", 1), ("date", 1)],
@@ -838,6 +840,173 @@ def employee_monthly_analytics(
         "total_late_minutes": total_late_minutes,
         "total_overtime_minutes": total_overtime_minutes,
         "attendance_pct": attendance_pct
+    }
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = Query(default=None)
+):
+    parts = month.split("-")
+    year = int(parts[0])
+    m_int = int(parts[1])
+    _, last_day = calendar.monthrange(year, m_int)
+
+    match_stage = {"joined_on": {"$lte": f"{month}-{last_day:02d}"}}
+    if department is not None:
+        match_stage["department"] = department
+
+    pipeline = [
+        {"$match": match_stage},
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                "pipeline": [
+                    {
+                        "$match": {
+                            "date": {
+                                "$gte": f"{month}-01",
+                                "$lte": f"{month}-{last_day:02d}"
+                            }
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": None,
+                            "present_days": {
+                                "$sum": {
+                                    "$cond": [
+                                        {
+                                            "$and": [
+                                                {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                                {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 5]}
+                                            ]
+                                        },
+                                        {
+                                            "$cond": [
+                                                {"$eq": ["$half_day", True]},
+                                                0.5,
+                                                1.0
+                                            ]
+                                        },
+                                        0.0
+                                    ]
+                                }
+                            },
+                            "late_count": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                                        1,
+                                        0
+                                    ]
+                                }
+                            },
+                            "total_late_minutes": {
+                                "$sum": {"$ifNull": ["$late_minutes", 0]}
+                            },
+                            "leave_count": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$eq": ["$status", "LEAVE"]},
+                                        1,
+                                        0
+                                    ]
+                                }
+                            },
+                            "on_duty_count": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$eq": ["$status", "ON_DUTY"]},
+                                        1,
+                                        0
+                                    ]
+                                }
+                            },
+                            "work_hours_sum": {
+                                "$sum": {
+                                    "$cond": [
+                                        {
+                                            "$and": [
+                                                {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                                {"$isNumber": "$work_hours"}
+                                            ]
+                                        },
+                                        {"$toDecimal": "$work_hours"},
+                                        {"$toDecimal": 0}
+                                    ]
+                                }
+                            },
+                            "work_hours_count": {
+                                "$sum": {
+                                    "$cond": [
+                                        {
+                                            "$and": [
+                                                {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                                {"$isNumber": "$work_hours"}
+                                            ]
+                                        },
+                                        1,
+                                        0
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                ],
+                "as": "stats"
+            }
+        },
+        {
+            "$addFields": {
+                "emp_stats": {"$ifNull": [{"$arrayElemAt": ["$stats", 0]}, {}]}
+            }
+        },
+        {
+            "$group": {
+                "_id": "$department",
+                "headcount": {"$sum": 1},
+                "present_days": {"$sum": {"$ifNull": ["$emp_stats.present_days", 0.0]}},
+                "late_count": {"$sum": {"$ifNull": ["$emp_stats.late_count", 0]}},
+                "total_late_minutes": {"$sum": {"$ifNull": ["$emp_stats.total_late_minutes", 0]}},
+                "leave_count": {"$sum": {"$ifNull": ["$emp_stats.leave_count", 0]}},
+                "on_duty_count": {"$sum": {"$ifNull": ["$emp_stats.on_duty_count", 0]}},
+                "work_hours_sum": {"$sum": {"$ifNull": ["$emp_stats.work_hours_sum", {"$toDecimal": 0}]}},
+                "work_hours_count": {"$sum": {"$ifNull": ["$emp_stats.work_hours_count", 0]}}
+            }
+        },
+        {"$sort": {"_id": 1}}
+    ]
+
+    results = list(db.employees.aggregate(pipeline))
+
+    items = []
+    for doc in results:
+        wh_count = int(doc["work_hours_count"])
+        if wh_count > 0:
+            wh_sum = doc["work_hours_sum"].to_decimal() if hasattr(doc["work_hours_sum"], "to_decimal") else Decimal(str(doc["work_hours_sum"]))
+            wh_cnt = Decimal(wh_count)
+            avg_work_hours = float((wh_sum / wh_cnt).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        else:
+            avg_work_hours = None
+
+        items.append({
+            "department": doc["_id"],
+            "headcount": int(doc["headcount"]),
+            "present_days": float(doc["present_days"]),
+            "avg_work_hours": avg_work_hours,
+            "late_count": int(doc["late_count"]),
+            "total_late_minutes": int(doc["total_late_minutes"]),
+            "leave_count": int(doc["leave_count"]),
+            "on_duty_count": int(doc["on_duty_count"])
+        })
+
+    return {
+        "month": month,
+        "items": items
     }
 
 
