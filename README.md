@@ -16,7 +16,27 @@ git clone https://github.com/MunishUpadhyay/Employee-Attendance-and-Analytics-AP
 cd Employee-Attendance-and-Analytics-API
 ```
 
-### 2. Create and activate a virtual environment
+### 2. Start MongoDB with Docker (Windows PowerShell)
+The application requires MongoDB 6.0 or newer. You can run MongoDB 7 using Docker Desktop.
+
+> **Note:** Per the assignment guidelines, this repository intentionally does not include a `Dockerfile` or `docker-compose.yml`. Docker is used solely to run the official upstream MongoDB container.
+
+1. Ensure **Docker Desktop** is installed and running.
+2. If starting the container for the first time, run:
+```powershell
+docker run -d --name sdt-mongodb -p 127.0.0.1:27017:27017 -v sdt-mongo-data:/data/db mongo:7
+```
+3. If the container already exists from a previous run, start it with:
+```powershell
+docker start sdt-mongodb
+```
+4. Confirm MongoDB is responding to commands:
+```powershell
+docker exec sdt-mongodb mongosh --quiet --eval "db.adminCommand('ping')"
+```
+Expected output: `{ ok: 1 }`.
+
+### 3. Create and activate a virtual environment
 On Windows (PowerShell):
 ```powershell
 python -m venv .venv
@@ -29,7 +49,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-### 3. Install dependencies
+### 4. Install dependencies
 ```powershell
 pip install -r requirements.txt
 ```
@@ -39,15 +59,15 @@ Verify that all dependencies installed cleanly:
 python -m pip check
 ```
 
-### 4. Configure environment variables
-The service reads connection settings from system environment variables or a local `.env` file. System environment variables take precedence over `.env`.
+### 5. Configure environment variables
+The service reads connection settings from system environment variables or a local `.env` file. System environment variables take precedence over `.env`. If not specified, default values connect directly to local MongoDB.
 
 - `MONGO_URI`: MongoDB connection string (default: `mongodb://localhost:27017`).
 - `MONGO_DB`: Database name (default: `attendance_db`).
 
-In PowerShell:
+In PowerShell (optional if using defaults):
 ```powershell
-$env:MONGO_URI = "mongodb://localhost:27017"
+$env:MONGO_URI = "mongodb://127.0.0.1:27017"
 $env:MONGO_DB = "attendance_db"
 ```
 
@@ -59,7 +79,7 @@ The repository includes nine sample attendance records and six employee records 
 python sample_seed.py
 ```
 
-*Note: Running `sample_seed.py` clears existing documents in `employees` and `attendance_logs` before inserting the starter sample.*
+> **Warning:** `sample_seed.py` executes `db[name].delete_many({})` on both `employees` and `attendance_logs` before inserting the sample documents. Run this script only against a disposable local or test development database, never against a shared or production database with data you wish to retain.
 
 ## Running the API
 
