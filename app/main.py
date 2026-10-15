@@ -62,13 +62,28 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+def compute_late_minutes(
+    punch_in: datetime,
+    shift_start: str,
+    attendance_date: Optional[str] = None
+) -> int:
     h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    diff_seconds = (punch_in - start).total_seconds()
+    if punch_in.tzinfo is None:
+        punch_in = punch_in.replace(tzinfo=timezone.utc)
+    punch_in_ist = punch_in.astimezone(IST).replace(microsecond=0)
+
+    if attendance_date:
+        start = datetime.fromisoformat(attendance_date).replace(
+            hour=h, minute=m, second=0, microsecond=0, tzinfo=IST
+        )
+    else:
+        start = punch_in_ist.replace(hour=h, minute=m, second=0, microsecond=0)
+
+    diff_seconds = (punch_in_ist - start).total_seconds()
     if diff_seconds > 600:
         return int(diff_seconds // 60)
     return 0
+
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -313,7 +328,7 @@ def punch_in(body: PunchInIn):
         "punch_out": None,
         "work_hours": None,
         "late_minutes": compute_late_minutes(
-            ts, emp["shift_start"]
+            ts, emp["shift_start"], d
         ),
         "overtime_minutes": 0,
         "half_day": False,
@@ -660,7 +675,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
             new_overtime_minutes = 0
             new_half_day = False
 
-        new_late_minutes = compute_late_minutes(ts_ist, emp["shift_start"])
+        new_late_minutes = compute_late_minutes(ts_ist, emp["shift_start"], date)
 
     changes = {}
     if record["status"] != target_status:
