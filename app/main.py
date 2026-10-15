@@ -1010,6 +1010,93 @@ def department_summary(
     }
 
 
+def build_late_leaderboard_pipeline(month: str, limit: int = 10, department: Optional[str] = None):
+    parts = month.split("-")
+    year = int(parts[0])
+    m_int = int(parts[1])
+    _, last_day = calendar.monthrange(year, m_int)
+
+    pipeline = [
+        {
+            "$match": {
+                "date": {"$gte": f"{month}-01", "$lte": f"{month}-{last_day:02d}"},
+                "late_minutes": {"$gt": 0}
+            }
+        },
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {"$sum": "$late_minutes"},
+                "late_count": {"$sum": 1}
+            }
+        },
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "_id",
+                "foreignField": "emp_code",
+                "as": "emp"
+            }
+        },
+        {"$unwind": "$emp"}
+    ]
+
+    if department is not None:
+        pipeline.append({"$match": {"emp.department": department}})
+
+    pipeline.extend([
+        {
+            "$setWindowFields": {
+                "sortBy": {"total_late_minutes": -1},
+                "output": {
+                    "rank": {"$rank": {}}
+                }
+            }
+        },
+        {"$match": {"rank": {"$lte": limit}}},
+        {
+            "$project": {
+                "_id": 0,
+                "rank": 1,
+                "emp_code": "$_id",
+                "name": "$emp.name",
+                "department": "$emp.department",
+                "total_late_minutes": 1,
+                "late_count": 1
+            }
+        },
+        {"$sort": {"total_late_minutes": -1, "emp_code": 1}}
+    ])
+    return pipeline
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(default=10, ge=1, le=50),
+    department: Optional[str] = Query(default=None)
+):
+    pipeline = build_late_leaderboard_pipeline(month, limit, department)
+    results = list(db.attendance_logs.aggregate(pipeline))
+
+    items = [
+        {
+            "rank": int(doc["rank"]),
+            "emp_code": str(doc["emp_code"]),
+            "name": str(doc["name"]),
+            "department": str(doc["department"]),
+            "total_late_minutes": int(doc["total_late_minutes"]),
+            "late_count": int(doc["late_count"])
+        }
+        for doc in results
+    ]
+
+    return {
+        "month": month,
+        "items": items
+    }
+
+
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
