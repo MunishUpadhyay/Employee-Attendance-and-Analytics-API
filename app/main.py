@@ -9,6 +9,7 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import calendar
 from datetime import datetime, timedelta, timezone, time
 from typing import Optional, Literal
 
@@ -717,6 +718,127 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
     updated.setdefault("half_day", False)
 
     return serialize_datetimes(updated)
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly_analytics(
+    emp_code: str,
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found"
+        )
+
+    year, month_num = map(int, month.split("-"))
+    _, last_day = calendar.monthrange(year, month_num)
+    month_start = datetime(year, month_num, 1).date()
+    month_end = datetime(year, month_num, last_day).date()
+
+    emp_joined_on = datetime.strptime(emp["joined_on"], "%Y-%m-%d").date()
+    start_date = max(month_start, emp_joined_on)
+
+    if start_date > month_end:
+        working_days = 0
+    else:
+        working_days = sum(
+            1 for day_offset in range((month_end - start_date).days + 1)
+            if (start_date + timedelta(days=day_offset)).weekday() < 5
+        )
+
+    pipeline = [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": {"$gte": f"{month}-01", "$lte": f"{month}-{last_day:02d}"}
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 5]}
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    {"$eq": ["$half_day", True]},
+                                    0.5,
+                                    1.0
+                                ]
+                            },
+                            0.0
+                        ]
+                    }
+                },
+                "leave_days": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$status", "LEAVE"]},
+                            1,
+                            0
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                            1,
+                            0
+                        ]
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {"$ifNull": ["$late_minutes", 0]}
+                },
+                "total_overtime_minutes": {
+                    "$sum": {"$ifNull": ["$overtime_minutes", 0]}
+                }
+            }
+        }
+    ]
+
+    results = list(db.attendance_logs.aggregate(pipeline))
+
+    if results:
+        m = results[0]
+        present_days = float(m["present_days"])
+        leave_days = int(m["leave_days"])
+        late_count = int(m["late_count"])
+        total_late_minutes = int(m["total_late_minutes"])
+        total_overtime_minutes = int(m["total_overtime_minutes"])
+    else:
+        present_days = 0.0
+        leave_days = 0
+        late_count = 0
+        total_late_minutes = 0
+        total_overtime_minutes = 0
+
+    if working_days == 0:
+        attendance_pct = None
+    else:
+        pct_dec = (Decimal(str(present_days)) * Decimal(100)) / Decimal(working_days)
+        attendance_pct = float(pct_dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": leave_days,
+        "late_count": late_count,
+        "total_late_minutes": total_late_minutes,
+        "total_overtime_minutes": total_overtime_minutes,
+        "attendance_pct": attendance_pct
+    }
 
 
 
